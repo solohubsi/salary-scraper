@@ -1,14 +1,11 @@
 """
-ITJobsWatch Scraper v3 (UK only)
+ITJobsWatch Scraper v4 (UK only)
 =================================
-Ключові зміни vs v2:
-- ОДИН URL на категорію (не окремі для senior/middle)
-- Middle = 25th percentile зарплат
-- Senior = 75th percentile зарплат
-- Парсинг виправлено: шукаємо конкретні рядки таблиці
+URL format: spaces encoded as %20 (NOT +)
+  Middle: /jobs/uk/java%20developer.do       (загальна сторінка)
+  Senior: /jobs/uk/senior%20java%20developer.do (senior-specific)
  
-ITJobsWatch URL format: /jobs/uk/{slug}.do
-Slug використовує пробіли (в URL кодуються як %20 автоматично)
+Дані: median, 25th/75th percentile (annual GBP)
 """
  
 import time
@@ -17,6 +14,7 @@ import requests
 import pandas as pd
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import quote
 from bs4 import BeautifulSoup
  
 BASE_DIR     = Path(__file__).parent.parent
@@ -55,16 +53,23 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
  
  
-def fetch_salary(slug: str) -> dict:
+def build_url(slug, grade):
     """
-    Парсить сторінку ITJobsWatch для slug.
-    Повертає: median, pct25, pct75 (annual GBP).
- 
-    Middle = 25th percentile (нижня квартиль)
-    Senior = 75th percentile (верхня квартиль)
+    Будує правильний URL для ITJobsWatch.
+    Middle: /jobs/uk/{slug}.do
+    Senior: /jobs/uk/senior {slug}.do
+    Пробіли кодуються як %20 через quote()
     """
-    url = f"https://www.itjobswatch.co.uk/jobs/uk/{slug.replace(chr(32), chr(43))}.do"
+    if grade == "Senior":
+        full_slug = "senior " + slug
+    else:
+        full_slug = slug
+    encoded = quote(full_slug)
+    return f"https://www.itjobswatch.co.uk/jobs/uk/{encoded}.do"
  
+ 
+def fetch_salary(url):
+    """Парсить сторінку ITJobsWatch. Повертає median, pct25, pct75 (annual GBP)."""
     try:
         r = requests.get(url, headers=HEADERS, timeout=20)
         r.raise_for_status()
@@ -73,7 +78,7 @@ def fetch_salary(slug: str) -> dict:
         return {}
  
     soup   = BeautifulSoup(r.text, "html.parser")
-    result = {"median": None, "pct25": None, "pct75": None, "url": url}
+    result = {"median": None, "pct25": None, "pct75": None}
  
     def parse_gbp(text):
         cleaned = text.replace("£", "").replace(",", "").strip()
@@ -109,7 +114,6 @@ def fetch_salary(slug: str) -> dict:
                     if val:
                         result["pct75"] = val
  
-        # Fallback якщо немає percentiles
         if result["median"] and not result["pct25"]:
             result["pct25"] = result["median"] * 0.80
         if result["median"] and not result["pct75"]:
@@ -121,11 +125,11 @@ def fetch_salary(slug: str) -> dict:
     return result
  
  
-def to_monthly_usd(annual_gbp: float) -> int:
+def to_monthly_usd(annual_gbp):
     return round(annual_gbp / 12 * GBP_TO_USD)
  
  
-def load_existing_keys() -> set:
+def load_existing_keys():
     if not OUTPUT_FILE.exists():
         return set()
     try:
@@ -138,7 +142,7 @@ def load_existing_keys() -> set:
         return set()
  
  
-def append_to_master(rows: list):
+def append_to_master(rows):
     if not rows:
         return
     df_new = pd.DataFrame(rows)
@@ -155,8 +159,9 @@ def append_to_master(rows: list):
  
 def run():
     log.info("=" * 65)
-    log.info(f"ITJobsWatch scraper v3 started: {datetime.now().isoformat()}")
-    log.info("Middle = 25th percentile | Senior = 75th percentile")
+    log.info(f"ITJobsWatch scraper v4 started: {datetime.now().isoformat()}")
+    log.info("Middle = general page | Senior = senior-specific page")
+    log.info("URLs use %20 encoding (not +)")
     log.info("=" * 65)
  
     mapping  = pd.read_csv(MAPPING_FILE)
@@ -171,66 +176,57 @@ def run():
         slug       = str(row.get("itjobswatch_slug", "")).strip()
  
         if not slug or slug == "nan":
-            log.debug(f"  Skip {djinni_cat} — no ITJobsWatch slug")
+            log.debug(f"  Skip {djinni_cat} -- no ITJobsWatch slug")
             continue
  
-        mid_key = (djinni_cat, "2-3 роки", "UK", today)
-        sen_key = (djinni_cat, "5+ років", "UK", today)
-        if mid_key in existing and sen_key in existing:
-            skipped += 2
-            continue
+        for grade in ["Middle", "Senior"]:
+            exp_label = EXPERIENCE_LABEL_MAP[grade]
+            dedup_key = (djinni_cat, exp_label, "UK", today)
  
-        # Один запит на категорію
-        data = fetch_salary(slug)
-        time.sleep(1.5)
+            if dedup_key in existing:
+                skipped += 1
+                continue
  
-        pct25  = data.get("pct25")
-        median = data.get("median")
-        pct75  = data.get("pct75")
+            url  = build_url(slug, grade)
+            data = fetch_salary(url)
+            time.sleep(1.5)
  
-        if not any([median, pct25, pct75]):
-            no_data += 1
-            log.debug(f"  No data: {djinni_cat} | {slug}")
-            for grade in ["Middle", "Senior"]:
+            median = data.get("median")
+            pct25  = data.get("pct25")
+            pct75  = data.get("pct75")
+ 
+            if not any([median, pct25, pct75]):
+                no_data += 1
+                log.debug(f"  No data: {djinni_cat} {grade} | {url}")
                 new_rows.append({
                     "category_original":   slug,
                     "category_djinni":     djinni_cat,
                     "experience_original": grade,
-                    "experience_label":    EXPERIENCE_LABEL_MAP[grade],
+                    "experience_label":    exp_label,
                     "salary_min":          None,
                     "salary_max":          None,
                     "country":             "UK",
                     "scrape_date":         today,
                     "source":              "itjobswatch",
                 })
-            continue
+                continue
  
-        # Middle = навколо 25th percentile
-        if pct25:
-            mid_min = to_monthly_usd(pct25 * 0.90)
-            mid_max = to_monthly_usd(pct25 * 1.10)
-        elif median:
-            mid_min = to_monthly_usd(median * 0.75)
-            mid_max = to_monthly_usd(median * 0.90)
-        else:
-            mid_min = mid_max = None
+            # Middle: навколо медіани або pct25
+            # Senior: навколо senior-page медіани або pct75
+            if grade == "Senior":
+                base = median or pct75
+                s_min = to_monthly_usd(base * 0.90) if base else None
+                s_max = to_monthly_usd(base * 1.10) if base else None
+            else:
+                base = median or pct25
+                s_min = to_monthly_usd(base * 0.85) if base else None
+                s_max = to_monthly_usd(base * 1.00) if base else None
  
-        # Senior = навколо 75th percentile
-        if pct75:
-            sen_min = to_monthly_usd(pct75 * 0.90)
-            sen_max = to_monthly_usd(pct75 * 1.10)
-        elif median:
-            sen_min = to_monthly_usd(median * 1.10)
-            sen_max = to_monthly_usd(median * 1.30)
-        else:
-            sen_min = sen_max = None
- 
-        for grade, s_min, s_max in [("Middle", mid_min, mid_max), ("Senior", sen_min, sen_max)]:
             new_rows.append({
                 "category_original":   slug,
                 "category_djinni":     djinni_cat,
                 "experience_original": grade,
-                "experience_label":    EXPERIENCE_LABEL_MAP[grade],
+                "experience_label":    exp_label,
                 "salary_min":          s_min,
                 "salary_max":          s_max,
                 "country":             "UK",
@@ -238,18 +234,17 @@ def run():
                 "source":              "itjobswatch",
             })
  
-        if mid_min:
-            log.info(
-                f"  OK {djinni_cat:25s} | "
-                f"Mid ${mid_min:,}-${mid_max:,} | "
-                f"Sen ${sen_min:,}-${sen_max:,} | "
-                f"(25p=£{pct25 or 0:,.0f} med=£{median or 0:,.0f} 75p=£{pct75 or 0:,.0f})"
-            )
+            if s_min:
+                log.info(
+                    f"  OK {djinni_cat:25s} {grade:7s} "
+                    f"${s_min:,}-${s_max:,} "
+                    f"(med=£{median or 0:,.0f})"
+                )
  
     append_to_master(new_rows)
  
     log.info("\n-- SUMMARY --")
-    log.info(f"  Categories: {len(new_rows)//2} | With data: {len([r for r in new_rows if r['salary_min']])//2} | No data: {no_data} | Skipped: {skipped//2}")
+    log.info(f"  With data: {len([r for r in new_rows if r['salary_min']])} | No data: {no_data} | Skipped: {skipped}")
     log.info(f"  Output: {OUTPUT_FILE}")
  
  
