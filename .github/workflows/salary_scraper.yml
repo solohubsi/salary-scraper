@@ -105,7 +105,7 @@ jobs:
 
       - name: Run aggregator
         id: aggregator
-        run: python scrapers/aggregator.py
+        run: python salary_scraper/scrapers/aggregator.py
 
       - name: Validate output files
         id: validate
