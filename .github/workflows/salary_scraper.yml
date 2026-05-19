@@ -14,40 +14,54 @@ permissions:
   contents: write
 
 jobs:
-  scrape-and-save:
-    name: "Scrape, Append & Commit Data"
+
+  scrape-adzuna:
+    name: "Adzuna API — PL / UK / US / DE / NL"
     runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.sources == 'adzuna' || github.event.inputs.sources == 'all' || github.event_name == 'schedule' }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-
       - run: pip install -r salary_scraper/requirements.txt
       - run: mkdir -p salary_scraper/data salary_scraper/logs
-
-      # 1. Запуск Adzuna (допише дані в існуючий у репозиторії файл)
+      
       - name: Run Adzuna scraper
-        if: ${{ github.event.inputs.sources == 'adzuna' || github.event.inputs.sources == 'all' || github.event_name == 'schedule' }}
         env:
           ADZUNA_APP_ID:  ${{ secrets.ADZUNA_APP_ID }}
           ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
         run: python salary_scraper/scrapers/adzuna_scraper.py
-
-      # 2. Запуск ITJobsWatch (теж допише дані)
-      - name: Run ITJobsWatch scraper
-        if: ${{ github.event.inputs.sources == 'itjobswatch' || github.event.inputs.sources == 'all' || github.event_name == 'schedule' }}
-        run: python salary_scraper/scrapers/itjobswatch_scraper.py
-
-      # 3. Збереження оновлених файлів назад у ваш репозиторій на GitHub
-      - name: Commit and Push changes
+        
+      - name: Commit Adzuna changes
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@://github.com"
-          git add salary_scraper/data/
-          # Якщо зміни є, робимо комміт. Якщо змін немає, крок просто успішно завершиться.
-          git diff --staged --quiet || git commit -m "chore: daily salary data update $(date +%Y-%m-%d)"
-          git push
+          git add salary_scraper/data/adzuna_all.csv
+          git diff --staged --quiet || (git pull --rebase && git commit -m "chore: adzuna data update $(date +%Y-%m-%d)" && git push)
+
+  scrape-itjobswatch:
+    name: "ITJobsWatch — UK medians"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.sources == 'itjobswatch' || github.event.inputs.sources == 'all' || github.event_name == 'schedule' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r salary_scraper/requirements.txt
+      - run: mkdir -p salary_scraper/data salary_scraper/logs
+      
+      - name: Run ITJobsWatch scraper
+        run: python salary_scraper/scrapers/itjobswatch_scraper.py
+        
+      - name: Commit ITJobsWatch changes
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@://github.com"
+          git add salary_scraper/data/itjobswatch_all.csv
+          git diff --staged --quiet || (git pull --rebase && git commit -m "chore: itjobswatch data update $(date +%Y-%m-%d)" && git push)
+
 
