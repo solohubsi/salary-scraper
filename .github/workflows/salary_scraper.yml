@@ -39,7 +39,10 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@://github.com"
           git add salary_scraper/data/adzuna_all.csv
-          git diff --staged --quiet || (git pull --rebase && git commit -m "chore: adzuna data update $(date +%Y-%m-%d)" && git push)
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: adzuna data update $(date +%Y-%m-%d)"
+            git push origin HEAD || (git pull --rebase origin main && git push origin HEAD)
+          fi
 
   scrape-itjobswatch:
     name: "ITJobsWatch — UK medians"
@@ -62,6 +65,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@://github.com"
           git add salary_scraper/data/itjobswatch_all.csv
-          git diff --staged --quiet || (git pull --rebase && git commit -m "chore: itjobswatch data update $(date +%Y-%m-%d)" && git push)
-
-
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: itjobswatch data update $(date +%Y-%m-%d)"
+            git push origin HEAD || (git pull --rebase origin main && git push origin HEAD)
+          fi
