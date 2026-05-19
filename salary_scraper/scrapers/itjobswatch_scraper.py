@@ -1,10 +1,14 @@
 """
-ITJobsWatch Scraper v2 (UK only)
+ITJobsWatch Scraper v3 (UK only)
 =================================
-- Всі 113 Djinni категорій → пошук на ITJobsWatch
-- Append mode → один файл itjobswatch_all.csv росте щодня
-- Схема: category_original | category_djinni | experience_original |
-         experience_label | salary_min | salary_max | country | scrape_date | source
+Ключові зміни vs v2:
+- ОДИН URL на категорію (не окремі для senior/middle)
+- Middle = 25th percentile зарплат
+- Senior = 75th percentile зарплат
+- Парсинг виправлено: шукаємо конкретні рядки таблиці
+
+ITJobsWatch URL format: /jobs/uk/{slug}.do
+Slug використовує + між словами
 """
 
 import time
@@ -25,7 +29,6 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 GBP_TO_USD = 1.27
-BASE_URL   = "https://www.itjobswatch.co.uk/jobs/uk/{slug}.do"
 
 HEADERS = {
     "User-Agent": (
@@ -34,12 +37,6 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-GB,en;q=0.9",
-}
-
-# Префікси грейду для ITJobsWatch slug
-GRADE_PREFIXES = {
-    "Senior": "senior ",   # пробіл — ITJobsWatch URL format
-    "Middle": "",          # без префіксу — загальний запит
 }
 
 EXPERIENCE_LABEL_MAP = {
@@ -58,14 +55,14 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── SCRAPER ───────────────────────────────────────────────────────
-
 def fetch_salary(slug: str) -> dict:
     """
     Парсить сторінку ITJobsWatch для slug.
-    Повертає: median, pct25, pct75 (annual GBP).
+    Middle = 25th percentile (нижня квартиль)
+    Senior = 75th percentile (верхня квартиль)
     """
-    url = BASE_URL.format(slug=slug)
+    url = f"https://www.itjobswatch.co.uk/jobs/uk/{slug.replace(chr(32), chr(43))}.do"
+
     try:
         r = requests.get(url, headers=HEADERS, timeout=20)
         r.raise_for_status()
@@ -74,7 +71,17 @@ def fetch_salary(slug: str) -> dict:
         return {}
 
     soup   = BeautifulSoup(r.text, "html.parser")
-    result = {"median": None, "pct25": None, "pct75": None, "vacancies": None}
+    result = {"median": None, "pct25": None, "pct75": None, "url": url}
+
+    def parse_gbp(text: str):
+        cleaned = text.replace("£", "").replace(",", "").strip()
+        try:
+            val = float(cleaned.split()[0])
+            if 15000 < val < 300000:
+                return val
+        except (ValueError, IndexError):
+            pass
+        return None
 
     try:
         for table in soup.find_all("table"):
@@ -82,140 +89,5 @@ def fetch_salary(slug: str) -> dict:
                 cells = row.find_all(["td", "th"])
                 if len(cells) < 2:
                     continue
-                label = cells[0].get_text(strip=True).lower()
-                raw   = cells[1].get_text(strip=True).replace(",", "").replace("£", "").strip()
-                val   = None
-                try:
-                    val = float(raw.split()[0]) if raw else None
-                except (ValueError, IndexError):
-                    pass
-
-                if val and "median" in label and "salary" in label:
-                    result["median"] = val
-                elif val and ("25th" in label or "lower quartile" in label):
-                    result["pct25"] = val
-                elif val and ("75th" in label or "upper quartile" in label):
-                    result["pct75"] = val
-                elif val and "vacancies" in label and "ranked" in label:
-                    result["vacancies"] = int(val)
-
-    except Exception as e:
-        log.debug(f"Parse error {url}: {e}")
-
-    return result
-
-
-def salary_to_monthly_usd(annual_gbp: float) -> int:
-    return round(annual_gbp / 12 * GBP_TO_USD)
-
-
-# ── DEDUP ─────────────────────────────────────────────────────────
-
-def load_existing_keys() -> set:
-    if not OUTPUT_FILE.exists():
-        return set()
-    try:
-        df = pd.read_csv(OUTPUT_FILE, usecols=[
-            "category_djinni", "experience_label", "country", "scrape_date"
-        ])
-        return set(zip(df["category_djinni"], df["experience_label"],
-                       df["country"], df["scrape_date"]))
-    except Exception:
-        return set()
-
-
-def append_to_master(rows: list):
-    if not rows:
-        return
-    df_new = pd.DataFrame(rows)
-    write_header = not OUTPUT_FILE.exists()
-    df_new.to_csv(OUTPUT_FILE, mode="a", header=write_header,
-                  index=False, encoding="utf-8-sig")
-    log.info(f"Appended {len(rows)} rows → {OUTPUT_FILE.name}")
-
-
-# ── MAIN ──────────────────────────────────────────────────────────
-
-def run():
-    log.info("=" * 65)
-    log.info(f"ITJobsWatch scraper v2 started: {datetime.now().isoformat()}")
-    log.info("=" * 65)
-
-    mapping  = pd.read_csv(MAPPING_FILE)
-    today    = date.today().isoformat()
-    existing = load_existing_keys()
-    new_rows = []
-    skipped  = 0
-    no_data  = 0
-
-    for _, row in mapping.iterrows():
-        djinni_cat  = row["djinni_category"]
-        base_slug   = str(row["itjobswatch_slug"]).strip()
-
-        # Пропускаємо якщо немає ITJobsWatch slug (non-IT або low volume)
-        if not base_slug or base_slug == "nan":
-            log.debug(f"  Skipping {djinni_cat} — no ITJobsWatch slug")
-            continue
-
-        for grade in ["Middle", "Senior"]:
-            experience_label = EXPERIENCE_LABEL_MAP[grade]
-
-            dedup_key = (djinni_cat, experience_label, "UK", today)
-            if dedup_key in existing:
-                skipped += 1
-                continue
-
-            # Senior → "senior+{slug}", Middle → "{slug}"
-            slug = GRADE_PREFIXES[grade] + base_slug
-            data = fetch_salary(slug)
-            time.sleep(1.5)
-
-            median = data.get("median")
-            pct25  = data.get("pct25")
-            pct75  = data.get("pct75")
-
-            if median is None and pct25 and pct75:
-                median = (pct25 + pct75) / 2
-
-            if median is None:
-                no_data += 1
-                salary_min = None
-                salary_max = None
-            else:
-                salary_min = salary_to_monthly_usd(pct25 or median * 0.85)
-                salary_max = salary_to_monthly_usd(pct75 or median * 1.15)
-
-            category_original = (GRADE_PREFIXES[grade] + base_slug).replace("+", " ").strip()
-
-            new_rows.append({
-                "category_original":   category_original,
-                "category_djinni":     djinni_cat,
-                "experience_original": grade,
-                "experience_label":    experience_label,
-                "salary_min":          salary_min,
-                "salary_max":          salary_max,
-                "country":             "UK",
-                "scrape_date":         today,
-                "source":              "itjobswatch",
-            })
-
-            if salary_min:
-                log.info(
-                    f"  ✓ {djinni_cat:25s} | {grade:7s} | UK | "
-                    f"${salary_min:,}–${salary_max:,}"
-                )
-            else:
-                log.debug(f"  No data: {djinni_cat} | {grade}")
-
-    append_to_master(new_rows)
-
-    log.info("\n── SUMMARY ──────────────────────────────────────────────")
-    log.info(f"  New rows written:  {len([r for r in new_rows if r['salary_min']])}")
-    log.info(f"  Null (no data):    {no_data}")
-    log.info(f"  Skipped (dedup):   {skipped}")
-    log.info(f"  Output file:       {OUTPUT_FILE}")
-    log.info("─" * 65)
-
-
-if __name__ == "__main__":
-    run()
+                label      = cells[0].get_text(strip=True).lower()
+                value_text = cells[-1].get_text
