@@ -1,0 +1,171 @@
+name: Salary Scraper — Daily Run
+
+# ── SCHEDULE ──────────────────────────────────────────────────────
+# Запускається щодня о 07:00 UTC (09:00 Kyiv, 08:00 Warsaw)
+# Аналогічно до Djinni скрапера в testprHR1
+on:
+  schedule:
+    - cron: "0 7 * * *"        # щодня 07:00 UTC
+
+  # Ручний запуск через GitHub UI або API
+  workflow_dispatch:
+    inputs:
+      sources:
+        description: "Which scrapers to run (adzuna | itjobswatch | all)"
+        required: false
+        default: "all"
+      dry_run:
+        description: "Dry run — не зберігати результати"
+        required: false
+        default: "false"
+
+# ── PERMISSIONS ───────────────────────────────────────────────────
+permissions:
+  contents: write      # для git push результатів
+  actions: read
+
+# ── JOBS ──────────────────────────────────────────────────────────
+jobs:
+
+  # ── Job 1: Adzuna (PL, UK, US, DE, NL) ─────────────────────────
+  scrape-adzuna:
+    name: "Adzuna API — PL / UK / US / DE / NL"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.sources == 'adzuna' || github.event.inputs.sources == 'all' || github.event_name == 'schedule' }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r salary_scraper/requirements.txt
+
+      - name: Create data/logs dirs
+        run: mkdir -p salary_scraper/data salary_scraper/logs
+
+      - name: Run Adzuna scraper
+        env:
+          ADZUNA_APP_ID:  ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+        run: python salary_scraper/scrapers/adzuna_scraper.py
+
+      - name: Upload Adzuna artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: adzuna-data-${{ github.run_id }}
+          path: salary_scraper/data/adzuna_*.csv
+          retention-days: 30
+
+  # ── Job 2: ITJobsWatch (UK) ──────────────────────────────────────
+  scrape-itjobswatch:
+    name: "ITJobsWatch — UK medians"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.sources == 'itjobswatch' || github.event.inputs.sources == 'all' || github.event_name == 'schedule' }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r salary_scraper/requirements.txt
+
+      - name: Create data/logs dirs
+        run: mkdir -p salary_scraper/data salary_scraper/logs
+
+      - name: Run ITJobsWatch scraper
+        run: python salary_scraper/scrapers/itjobswatch_scraper.py
+
+      - name: Upload ITJobsWatch artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: itjobswatch-data-${{ github.run_id }}
+          path: salary_scraper/data/itjobswatch_*.csv
+          retention-days: 30
+
+  # ── Job 3: Aggregator — запускається після обох скраперів ────────
+  aggregate:
+    name: "Aggregate & commit results"
+    runs-on: ubuntu-latest
+    needs: [scrape-adzuna, scrape-itjobswatch]
+    if: always()   # запускається навіть якщо один з попередніх впав
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r salary_scraper/requirements.txt
+
+      - name: Create data/logs dirs
+        run: mkdir -p salary_scraper/data salary_scraper/logs
+
+      # Скачуємо артефакти з попередніх jobs
+      - name: Download Adzuna data
+        uses: actions/download-artifact@v4
+        with:
+          name: adzuna-data-${{ github.run_id }}
+          path: salary_scraper/data/
+        continue-on-error: true
+
+      - name: Download ITJobsWatch data
+        uses: actions/download-artifact@v4
+        with:
+          name: itjobswatch-data-${{ github.run_id }}
+          path: salary_scraper/data/
+        continue-on-error: true
+
+      - name: Run aggregator
+        run: python salary_scraper/scrapers/aggregator.py
+
+      - name: Commit results to repo
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add salary_scraper/data/
+          git diff --staged --quiet || git commit -m "chore: salary data update $(date +%Y-%m-%d)"
+          git push
+
+      - name: Upload merged data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-salaries-${{ github.run_id }}
+          path: |
+            salary_scraper/data/merged_salaries_*.csv
+            data/salary_pivot_*.csv
+          retention-days: 90
+
+      - name: Print summary
+        run: |
+          echo "## Scraper Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f salary_scraper/data/merged_salaries_$(date +%Y-%m-%d).csv ]; then
+            ROW_COUNT=$(tail -n +2 salary_scraper/data/merged_salaries_$(date +%Y-%m-%d).csv | wc -l)
+            echo "✅ **Merged file:** \`merged_salaries_$(date +%Y-%m-%d).csv\` — **${ROW_COUNT} rows**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Merged file not found" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Source | File |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|------|" >> $GITHUB_STEP_SUMMARY
+          ls salary_scraper/data/*.csv 2>/dev/null | while read f; do
+            echo "| \`$(basename $f | cut -d_ -f1)\` | \`$(basename $f)\` |" >> $GITHUB_STEP_SUMMARY
+          done
