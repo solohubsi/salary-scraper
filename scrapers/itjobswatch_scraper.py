@@ -1,14 +1,10 @@
 """
-ITJobsWatch Scraper (UK)
-========================
-Збирає медіанні зарплати з itjobswatch.co.uk для UK ринку.
-URL pattern: https://www.itjobswatch.co.uk/jobs/uk/{skill}.do
-
-Дані: медіана, 25/75 percentile, кількість вакансій.
-Оновлення на сайті: щоденне.
-Обмеження: тільки UK ринок.
-
-Без API ключа — HTTP scraping публічних сторінок.
+ITJobsWatch Scraper v2 (UK only)
+=================================
+- Всі 113 Djinni категорій → пошук на ITJobsWatch
+- Append mode → один файл itjobswatch_all.csv росте щодня
+- Схема: category_original | category_djinni | experience_original |
+         experience_label | salary_min | salary_max | country | scrape_date | source
 """
 
 import time
@@ -19,21 +15,17 @@ from datetime import date, datetime
 from pathlib import Path
 from bs4 import BeautifulSoup
 
-OUTPUT_DIR = Path(__file__).parent.parent / "data"
-OUTPUT_DIR.mkdir(exist_ok=True)
+BASE_DIR     = Path(__file__).parent.parent
+DATA_DIR     = BASE_DIR / "data"
+LOGS_DIR     = BASE_DIR / "logs"
+MAPPING_FILE = BASE_DIR / "category_mapping.csv"
+OUTPUT_FILE  = DATA_DIR / "itjobswatch_all.csv"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(Path(__file__).parent.parent / "logs" / "itjobswatch.log"),
-    ],
-)
-log = logging.getLogger(__name__)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-BASE_URL = "https://www.itjobswatch.co.uk/jobs/uk/{skill}.do"
-GBP_TO_USD = 1.27  # оновлювати вручну або через fx API
+GBP_TO_USD = 1.27
+BASE_URL   = "https://www.itjobswatch.co.uk/jobs/uk/{slug}.do"
 
 HEADERS = {
     "User-Agent": (
@@ -44,111 +36,68 @@ HEADERS = {
     "Accept-Language": "en-GB,en;q=0.9",
 }
 
-# Маппінг позицій → URL slugs для ITJobsWatch
-# Перевірено вручну: ці slugs дають результати на сайті
-POSITION_SLUGS = {
-    "BE Java":         [("senior+java+developer", "Senior"), ("java+developer",        "Middle")],
-    "BE Node":         [("senior+node.js+developer","Senior"),("node.js+developer",    "Middle")],
-    "BE Python":       [("senior+python+developer","Senior"), ("python+developer",      "Middle")],
-    "BE Hybris":       [("senior+java+developer",  "Senior"), ("java+developer",        "Middle")],  # proxy
-    "FS Java":         [("senior+java+developer",  "Senior"), ("java+developer",        "Middle")],
-    "FS Node":         [("senior+node.js+developer","Senior"),("node.js+developer",    "Middle")],
-    "FS PHP":          [("senior+php+developer",   "Senior"), ("php+developer",         "Middle")],
-    "FS .Net":         [("senior+.net+developer",  "Senior"), (".net+developer",        "Middle")],
-    "FS Python":       [("senior+python+developer","Senior"), ("python+developer",      "Middle")],
-    "FE":              [("senior+front+end+developer","Senior"),("front+end+developer","Middle")],
-    "FE Java":         [("senior+java+developer",  "Senior"), ("java+developer",        "Middle")],  # proxy
-    "FE Platforms":    [("senior+react+developer", "Senior"), ("react+developer",       "Middle")],
-    "QA":              [("senior+test+engineer",   "Senior"), ("test+engineer",         "Middle")],
-    "DevOps":          [("senior+devops+engineer", "Senior"), ("devops+engineer",       "Middle")],
-    "PM":              [("senior+project+manager", "Senior"), ("it+project+manager",    "Middle")],
-    "UI/UX Design":    [("senior+ux+designer",     "Senior"), ("ux+designer",           "Middle")],
-    "Mobile IOS":      [("senior+ios+developer",   "Senior"), ("ios+developer",         "Middle")],
-    "Mobile Hybrid":   [("senior+react+native",    "Senior"), ("react+native+developer","Middle")],
-    "Mobile Native":   [("senior+android+developer","Senior"),("android+developer",    "Middle")],
-    "Data Scientist":  [("senior+data+scientist",  "Senior"), ("data+scientist",        "Middle")],
-    "Embedded Dev":    [("senior+embedded+engineer","Senior"),("embedded+software",    "Middle")],
-    "Salesforce Dev":  [("senior+salesforce+developer","Senior"),("salesforce+developer","Middle")],
+# Префікси грейду для ITJobsWatch slug
+GRADE_PREFIXES = {
+    "Senior": "senior ",   # пробіл — ITJobsWatch URL format
+    "Middle": "",          # без префіксу — загальний запит
 }
 
+EXPERIENCE_LABEL_MAP = {
+    "Middle": "2-3 роки",
+    "Senior": "5+ років",
+}
 
-def fetch_itjobswatch(slug: str) -> dict:
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOGS_DIR / "itjobswatch.log"),
+    ],
+)
+log = logging.getLogger(__name__)
+
+
+# ── SCRAPER ───────────────────────────────────────────────────────
+
+def fetch_salary(slug: str) -> dict:
     """
-    Завантажує сторінку ITJobsWatch і парсить salary stats.
-    Повертає: median, pct25, pct75, vacancies (annual GBP).
+    Парсить сторінку ITJobsWatch для slug.
+    Повертає: median, pct25, pct75 (annual GBP).
     """
-    url = BASE_URL.format(skill=slug)
+    url = BASE_URL.format(slug=slug)
     try:
         r = requests.get(url, headers=HEADERS, timeout=20)
         r.raise_for_status()
-    except requests.HTTPError as e:
-        log.warning(f"HTTP {e.response.status_code}: {url}")
-        return {}
     except Exception as e:
-        log.error(f"Request failed {url}: {e}")
+        log.warning(f"Fetch failed {url}: {e}")
         return {}
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup   = BeautifulSoup(r.text, "html.parser")
+    result = {"median": None, "pct25": None, "pct75": None, "vacancies": None}
 
-    result = {
-        "url":       url,
-        "median":    None,
-        "pct25":     None,
-        "pct75":     None,
-        "vacancies": None,
-    }
-
-    # ITJobsWatch: salary stats є в таблиці з class "salary-stats" або inline
-    # Шукаємо "Median Salary" → значення поряд
     try:
-        # Основна таблиця зарплат
-        tables = soup.find_all("table")
-        for table in tables:
-            rows = table.find_all("tr")
-            for row in rows:
+        for table in soup.find_all("table"):
+            for row in table.find_all("tr"):
                 cells = row.find_all(["td", "th"])
-                if len(cells) >= 2:
-                    label = cells[0].get_text(strip=True).lower()
-                    value_text = cells[1].get_text(strip=True).replace(",", "").replace("£", "").replace("$", "")
+                if len(cells) < 2:
+                    continue
+                label = cells[0].get_text(strip=True).lower()
+                raw   = cells[1].get_text(strip=True).replace(",", "").replace("£", "").strip()
+                val   = None
+                try:
+                    val = float(raw.split()[0]) if raw else None
+                except (ValueError, IndexError):
+                    pass
 
-                    if "median" in label and "salary" in label:
-                        try:
-                            result["median"] = float(value_text.split()[0])
-                        except (ValueError, IndexError):
-                            pass
-
-                    elif "25th" in label or "lower quartile" in label:
-                        try:
-                            result["pct25"] = float(value_text.split()[0])
-                        except (ValueError, IndexError):
-                            pass
-
-                    elif "75th" in label or "upper quartile" in label:
-                        try:
-                            result["pct75"] = float(value_text.split()[0])
-                        except (ValueError, IndexError):
-                            pass
-
-                    elif "vacancies" in label and "ranked" in label:
-                        try:
-                            result["vacancies"] = int(value_text.split()[0])
-                        except (ValueError, IndexError):
-                            pass
-
-        # Fallback: шукаємо salary в meta або структурованих даних
-        if result["median"] is None:
-            # Спроба знайти через span з класом
-            for span in soup.find_all(["span", "strong", "td"]):
-                text = span.get_text(strip=True)
-                if "£" in text and "," in text:
-                    clean = text.replace("£", "").replace(",", "").strip()
-                    try:
-                        val = float(clean.split()[0])
-                        if 20000 < val < 250000:  # розумний діапазон для UK IT
-                            if result["median"] is None:
-                                result["median"] = val
-                    except (ValueError, IndexError):
-                        pass
+                if val and "median" in label and "salary" in label:
+                    result["median"] = val
+                elif val and ("25th" in label or "lower quartile" in label):
+                    result["pct25"] = val
+                elif val and ("75th" in label or "upper quartile" in label):
+                    result["pct75"] = val
+                elif val and "vacancies" in label and "ranked" in label:
+                    result["vacancies"] = int(val)
 
     except Exception as e:
         log.debug(f"Parse error {url}: {e}")
@@ -156,80 +105,116 @@ def fetch_itjobswatch(slug: str) -> dict:
     return result
 
 
-def annual_gbp_to_monthly_usd(annual_gbp: float) -> int:
-    """Конвертує annual GBP → monthly USD"""
+def salary_to_monthly_usd(annual_gbp: float) -> int:
     return round(annual_gbp / 12 * GBP_TO_USD)
 
 
+# ── DEDUP ─────────────────────────────────────────────────────────
+
+def load_existing_keys() -> set:
+    if not OUTPUT_FILE.exists():
+        return set()
+    try:
+        df = pd.read_csv(OUTPUT_FILE, usecols=[
+            "category_djinni", "experience_label", "country", "scrape_date"
+        ])
+        return set(zip(df["category_djinni"], df["experience_label"],
+                       df["country"], df["scrape_date"]))
+    except Exception:
+        return set()
+
+
+def append_to_master(rows: list):
+    if not rows:
+        return
+    df_new = pd.DataFrame(rows)
+    write_header = not OUTPUT_FILE.exists()
+    df_new.to_csv(OUTPUT_FILE, mode="a", header=write_header,
+                  index=False, encoding="utf-8-sig")
+    log.info(f"Appended {len(rows)} rows → {OUTPUT_FILE.name}")
+
+
+# ── MAIN ──────────────────────────────────────────────────────────
+
 def run():
-    """
-    Запускається кроном або вручну.
-    Результат: data/itjobswatch_YYYY-MM-DD.csv
-    """
-    log.info("=" * 60)
-    log.info(f"ITJobsWatch scraper started: {datetime.now().isoformat()}")
-    log.info("=" * 60)
+    log.info("=" * 65)
+    log.info(f"ITJobsWatch scraper v2 started: {datetime.now().isoformat()}")
+    log.info("=" * 65)
 
-    rows = []
+    mapping  = pd.read_csv(MAPPING_FILE)
+    today    = date.today().isoformat()
+    existing = load_existing_keys()
+    new_rows = []
+    skipped  = 0
+    no_data  = 0
 
-    for position, slug_grade_pairs in POSITION_SLUGS.items():
-        for slug, grade in slug_grade_pairs:
-            data = fetch_itjobswatch(slug)
-            time.sleep(1.5)  # поважаємо сайт
+    for _, row in mapping.iterrows():
+        djinni_cat  = row["djinni_category"]
+        base_slug   = str(row["itjobswatch_slug"]).strip()
 
-            median    = data.get("median")
-            pct25     = data.get("pct25")
-            pct75     = data.get("pct75")
-            vacancies = data.get("vacancies", 0)
+        # Пропускаємо якщо немає ITJobsWatch slug (non-IT або low volume)
+        if not base_slug or base_slug == "nan":
+            log.debug(f"  Skipping {djinni_cat} — no ITJobsWatch slug")
+            continue
+
+        for grade in ["Middle", "Senior"]:
+            experience_label = EXPERIENCE_LABEL_MAP[grade]
+
+            dedup_key = (djinni_cat, experience_label, "UK", today)
+            if dedup_key in existing:
+                skipped += 1
+                continue
+
+            # Senior → "senior+{slug}", Middle → "{slug}"
+            slug = GRADE_PREFIXES[grade] + base_slug
+            data = fetch_salary(slug)
+            time.sleep(1.5)
+
+            median = data.get("median")
+            pct25  = data.get("pct25")
+            pct75  = data.get("pct75")
+
+            if median is None and pct25 and pct75:
+                median = (pct25 + pct75) / 2
 
             if median is None:
-                log.warning(f"  No data: {position} | {grade} | slug={slug}")
-                # Використовуємо midpoint між pct25/pct75 якщо є
-                if pct25 and pct75:
-                    median = (pct25 + pct75) / 2
-                    log.info(f"  Fallback to pct midpoint: {median:.0f}")
-                else:
-                    continue
+                no_data += 1
+                salary_min = None
+                salary_max = None
+            else:
+                salary_min = salary_to_monthly_usd(pct25 or median * 0.85)
+                salary_max = salary_to_monthly_usd(pct75 or median * 1.15)
 
-            salary_min_usd = annual_gbp_to_monthly_usd(pct25 or median * 0.85)
-            salary_max_usd = annual_gbp_to_monthly_usd(pct75 or median * 1.15)
-            salary_med_usd = annual_gbp_to_monthly_usd(median)
+            category_original = (GRADE_PREFIXES[grade] + base_slug).replace("+", " ").strip()
 
-            row = {
-                "category":         position,
-                "experience_label": grade,
-                "salary_min":       salary_min_usd,
-                "salary_max":       salary_max_usd,
-                "salary_median":    salary_med_usd,
-                "salary_avg":       round((salary_min_usd + salary_max_usd) / 2),
-                "vacancies":        vacancies or 0,
-                "country":          "UK",
-                "scrape_date":      date.today().isoformat(),
-                "source":           "itjobswatch",
-                "source_url":       data.get("url", ""),
-            }
-            rows.append(row)
-            log.info(
-                f"  ✓ {position} {grade}: "
-                f"med=${salary_med_usd} "
-                f"(£{median:,.0f}/yr | pct25-75: £{pct25 or 0:,.0f}-£{pct75 or 0:,.0f})"
-            )
+            new_rows.append({
+                "category_original":   category_original,
+                "category_djinni":     djinni_cat,
+                "experience_original": grade,
+                "experience_label":    experience_label,
+                "salary_min":          salary_min,
+                "salary_max":          salary_max,
+                "country":             "UK",
+                "scrape_date":         today,
+                "source":              "itjobswatch",
+            })
 
-    if not rows:
-        log.error("No data collected! Site structure may have changed.")
-        return
+            if salary_min:
+                log.info(
+                    f"  ✓ {djinni_cat:25s} | {grade:7s} | UK | "
+                    f"${salary_min:,}–${salary_max:,}"
+                )
+            else:
+                log.debug(f"  No data: {djinni_cat} | {grade}")
 
-    df = pd.DataFrame(rows)
+    append_to_master(new_rows)
 
-    today = date.today().isoformat()
-    out_path = OUTPUT_DIR / f"itjobswatch_{today}.csv"
-    df.to_csv(out_path, index=False, encoding="utf-8-sig")
-    log.info(f"Saved: {out_path} ({len(df)} rows)")
-
-    latest_path = OUTPUT_DIR / "itjobswatch_latest.csv"
-    df.to_csv(latest_path, index=False, encoding="utf-8-sig")
-
-    log.info(f"\nTotal: {len(df)} rows | Middle: {len(df[df['experience_label']=='Middle'])} | Senior: {len(df[df['experience_label']=='Senior'])}")
+    log.info("\n── SUMMARY ──────────────────────────────────────────────")
+    log.info(f"  New rows written:  {len([r for r in new_rows if r['salary_min']])}")
+    log.info(f"  Null (no data):    {no_data}")
+    log.info(f"  Skipped (dedup):   {skipped}")
+    log.info(f"  Output file:       {OUTPUT_FILE}")
+    log.info("─" * 65)
 
 
 if __name__ == "__main__":
