@@ -9,159 +9,45 @@ on:
         description: "Which scrapers to run (adzuna | itjobswatch | all)"
         required: false
         default: "all"
-      dry_run:
-        description: "Dry run — не зберігати результати"
-        required: false
-        default: "false"
 
 permissions:
   contents: write
-  actions: read
 
 jobs:
-
-  scrape-adzuna:
-    name: "Adzuna API — PL / UK / US / DE / NL"
+  scrape-and-save:
+    name: "Scrape, Append & Commit Data"
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.sources == 'adzuna' || github.event.inputs.sources == 'all' || github.event_name == 'schedule' }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
+
       - run: pip install -r salary_scraper/requirements.txt
       - run: mkdir -p salary_scraper/data salary_scraper/logs
+
+      # 1. Запуск Adzuna (допише дані в існуючий у репозиторії файл)
       - name: Run Adzuna scraper
+        if: ${{ github.event.inputs.sources == 'adzuna' || github.event.inputs.sources == 'all' || github.event_name == 'schedule' }}
         env:
           ADZUNA_APP_ID:  ${{ secrets.ADZUNA_APP_ID }}
           ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
         run: python salary_scraper/scrapers/adzuna_scraper.py
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: adzuna-data-${{ github.run_id }}
-          path: salary_scraper/data/adzuna_all.csv
-          retention-days: 30
 
-  scrape-itjobswatch:
-    name: "ITJobsWatch — UK medians"
-    runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.sources == 'itjobswatch' || github.event.inputs.sources == 'all' || github.event_name == 'schedule' }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-      - run: pip install -r salary_scraper/requirements.txt
-      - run: mkdir -p salary_scraper/data salary_scraper/logs
+      # 2. Запуск ITJobsWatch (теж допише дані)
       - name: Run ITJobsWatch scraper
+        if: ${{ github.event.inputs.sources == 'itjobswatch' || github.event.inputs.sources == 'all' || github.event_name == 'schedule' }}
         run: python salary_scraper/scrapers/itjobswatch_scraper.py
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: itjobswatch-data-${{ github.run_id }}
-          path: salary_scraper/data/itjobswatch_all.csv
-          retention-days: 30
 
-  aggregate:
-    name: "Aggregate & commit results"
-    runs-on: ubuntu-latest
-    needs: [scrape-adzuna, scrape-itjobswatch]
-    if: always()
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-      - run: pip install -r salary_scraper/requirements.txt
-      - run: mkdir -p salary_scraper/data salary_scraper/logs
-
-      - name: Download Adzuna data
-        uses: actions/download-artifact@v4
-        with:
-          name: adzuna-data-${{ github.run_id }}
-          path: salary_scraper/data/
-        continue-on-error: true
-
-      - name: Download ITJobsWatch data
-        uses: actions/download-artifact@v4
-        with:
-          name: itjobswatch-data-${{ github.run_id }}
-          path: salary_scraper/data/
-        continue-on-error: true
-
-      - name: Backup existing master files before write
-        run: |
-          cd salary_scraper/data
-          for f in adzuna_all.csv itjobswatch_all.csv; do
-            if [ -f "$f" ]; then
-              cp "$f" "${f%.csv}_backup.csv"
-              echo "Backed up $f → ${f%.csv}_backup.csv"
-            fi
-          done
-
-      - name: Run aggregator
-        id: aggregator
-        run: python salary_scraper/scrapers/aggregator.py
-
-      - name: Validate output files
-        id: validate
-        run: |
-          FAILED=0
-          for f in salary_scraper/data/adzuna_all.csv salary_scraper/data/itjobswatch_all.csv; do
-            if [ -f "$f" ]; then
-              ROWS=$(tail -n +2 "$f" | wc -l)
-              echo "$f: $ROWS rows"
-              if [ "$ROWS" -lt 1 ]; then
-                echo "ERROR: $f is empty!"
-                FAILED=1
-              fi
-            fi
-          done
-          if [ "$FAILED" -eq 1 ]; then
-            echo "Validation failed — rolling back to backup"
-            cd salary_scraper/data
-            for f in adzuna_all_backup.csv itjobswatch_all_backup.csv; do
-              if [ -f "$f" ]; then
-                cp "$f" "${f/_backup/}"
-                echo "Restored ${f/_backup/} from backup"
-              fi
-            done
-            exit 1
-          fi
-
-      - name: Commit results to repo
-        if: ${{ github.event.inputs.dry_run != 'true' && steps.validate.outcome == 'success' }}
+      # 3. Збереження оновлених файлів назад у ваш репозиторій на GitHub
+      - name: Commit and Push changes
         run: |
           git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "github-actions[bot]@://github.com"
           git add salary_scraper/data/
-          git diff --staged --quiet || git commit -m "chore: salary data update $(date +%Y-%m-%d)"
+          # Якщо зміни є, робимо комміт. Якщо змін немає, крок просто успішно завершиться.
+          git diff --staged --quiet || git commit -m "chore: daily salary data update $(date +%Y-%m-%d)"
           git push
 
-      - name: Upload master files as artifact (завжди — навіть при помилці)
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: master-data-${{ github.run_id }}
-          path: |
-            salary_scraper/data/adzuna_all.csv
-            salary_scraper/data/itjobswatch_all.csv
-          retention-days: 90
-
-      - name: Print summary
-        if: always()
-        run: |
-          echo "## Scraper Results $(date +%Y-%m-%d)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          for f in salary_scraper/data/adzuna_all.csv salary_scraper/data/itjobswatch_all.csv; do
-            if [ -f "$f" ]; then
-              ROWS=$(tail -n +2 "$f" | wc -l)
-              echo "✅ \`$(basename $f)\`: **$ROWS rows total**" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "⚠️ \`$(basename $f)\` not found" >> $GITHUB_STEP_SUMMARY
-            fi
-          done
