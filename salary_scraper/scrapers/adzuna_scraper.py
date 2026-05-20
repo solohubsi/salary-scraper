@@ -211,23 +211,25 @@ def calc_stats(results: list, grade: str, fx: float, country: str = "UK") -> dic
  
 def load_existing_keys() -> set:
     """
-    Завантажує вже існуючі записи як set ключів
-    (category_djinni, experience_label, country, scrape_date)
-    для дедублікації при повторному запуску того ж дня.
+    Завантажує ключі ТІЛЬКИ за сьогодні для дедублікації.
+    Рядки за попередні дні НЕ впливають на поточний запуск.
     """
     if not OUTPUT_FILE.exists():
         return set()
     try:
+        today = date.today().isoformat()
         df = pd.read_csv(OUTPUT_FILE, usecols=[
             "category_djinni", "experience_label", "country", "scrape_date"
         ])
+        # Тільки сьогоднішні записи
+        df_today = df[df["scrape_date"] == today]
         keys = set(zip(
-            df["category_djinni"],
-            df["experience_label"],
-            df["country"],
-            df["scrape_date"],
+            df_today["category_djinni"],
+            df_today["experience_label"],
+            df_today["country"],
+            df_today["scrape_date"],
         ))
-        log.info(f"Existing records: {len(keys)} unique keys in {OUTPUT_FILE.name}")
+        log.info(f"Today's existing records: {len(keys)} keys for {today}")
         return keys
     except Exception as e:
         log.warning(f"Could not load existing keys: {e}")
