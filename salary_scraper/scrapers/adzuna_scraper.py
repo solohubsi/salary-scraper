@@ -341,4 +341,14 @@ def run():
     append_to_master(new_rows)
  
     log.info("\n── SUMMARY ──────────────────────────────────────────────")
-   
+    log.info(f"  New rows written:  {len([r for r in new_rows if r['salary_min']])}")
+    log.info(f"  Null (no data):    {no_data}")
+    log.info(f"  Skipped (dedup):   {skipped}")
+    log.info(f"  Total new rows:    {len(new_rows)}")
+    log.info(f"  Output file:       {OUTPUT_FILE}")
+    log.info("-" * 65)
+ 
+ 
+if __name__ == "__main__":
+    run()
+ 
